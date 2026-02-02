@@ -193,9 +193,8 @@ async def broadcast_message(data: dict) -> None:
             active_websockets.remove(ws)
 
 
-@app.post("/api/stop")
-async def stop_transcription(save: bool = True) -> Dict[str, Any]:
-    """Stop transcription and optionally save the transcript."""
+async def _perform_stop(save: bool = True) -> Dict[str, Any]:
+    """Internal stop logic reusable by endpoint and cleanup."""
     global audio_capture, session_start_time
     
     if not audio_capture or not audio_capture.is_recording:
@@ -253,6 +252,41 @@ async def stop_transcription(save: bool = True) -> Dict[str, Any]:
     return result
 
 
+@app.post("/api/stop")
+async def stop_transcription(save: bool = True) -> Dict[str, Any]:
+    """Stop transcription and optionally save the transcript."""
+    if not audio_capture or not audio_capture.is_recording:
+        raise HTTPException(status_code=400, detail="Not recording")
+    return await _perform_stop(save)
+
+
+@app.post("/api/interrupt")
+async def interrupt_transcription() -> Dict[str, Any]:
+    """Immediately stop transcription, discarding pending audio."""
+    global audio_capture, session_start_time
+    
+    # Broadcast status
+    await broadcast_message({"type": "status", "status": "interrupted"})
+    
+    # Stop recording if active
+    if audio_capture and audio_capture.is_recording:
+        audio_capture.stop()
+        # Ensure it's marked as stopped
+        audio_capture._recording = False 
+    
+    # Force stop transcriber (clears queue)
+    if transcriber and transcriber.is_busy:
+        await asyncio.get_event_loop().run_in_executor(None, transcriber.force_stop)
+        
+    session_start_time = None
+    logger.warning("Transcription interrupted by user")
+    
+    # Small delay to ensure resources are freed
+    await asyncio.sleep(0.2)
+    
+    return {"status": "interrupted"}
+
+
 @app.get("/api/transcript")
 async def get_current_transcript() -> Dict[str, Any]:
     """Get the current transcript (during or after recording)."""
@@ -291,6 +325,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     finally:
         if websocket in active_websockets:
             active_websockets.remove(websocket)
+            
+        # If no clients left and recording is active, stop it
+        if not active_websockets and audio_capture and audio_capture.is_recording:
+            logger.info("All clients disconnected. Auto-stopping recording...")
+            # We use ensure_future because finally block might not allow await in some contexts 
+            # or we don't want to block closure. But here await is fine in async func.
+            try:
+                await _perform_stop(save=True)
+            except Exception as e:
+                logger.error(f"Error in auto-stop: {e}")
 
 
 @app.get("/api/transcripts")

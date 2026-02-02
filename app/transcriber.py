@@ -171,6 +171,27 @@ class Transcriber:
         logger.info(f"Transcription stopped, {len(self._segments)} segments collected")
         return self._segments
     
+    def force_stop(self) -> None:
+        """Immediately stop transcription, clearing the queue."""
+        self._running = False
+        
+        # Clear the queue
+        while not self._transcription_queue.empty():
+            try:
+                self._transcription_queue.get_nowait()
+            except queue.Empty:
+                break
+                
+        # Put sentinel
+        self._transcription_queue.put(None)
+        
+        if self._worker_thread:
+            # Wait briefly (should be fast since queue is empty)
+            self._worker_thread.join(timeout=1.0)
+            self._worker_thread = None
+            
+        logger.warning("Transcription FORCE stopped")
+    
     def transcribe_chunk(self, audio: np.ndarray) -> None:
         """Queue an audio chunk for transcription."""
         if self._is_ready:
@@ -211,3 +232,8 @@ class Transcriber:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_busy(self) -> bool:
+        """Check if transcription worker is active (running or draining)."""
+        return self._worker_thread is not None and self._worker_thread.is_alive()
