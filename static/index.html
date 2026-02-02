@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CallScribe</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🎙️ CallScribe</h1>
+            <p class="subtitle">Transcribe browser calls in real-time</p>
+        </header>
+
+        <main>
+            <!-- Controls Panel -->
+            <section class="controls-panel">
+                <div class="control-group">
+                    <label for="device-select">Audio Device</label>
+                    <select id="device-select">
+                        <option value="">Loading devices...</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label for="language-select">Language</label>
+                    <select id="language-select">
+                        <option value="en">English 🇺🇸</option>
+                        <option value="uk">Ukrainian 🇺🇦</option>
+                    </select>
+                </div>
+
+                <div class="control-group buttons">
+                    <button id="start-btn" class="btn btn-primary">
+                        <span class="icon">▶</span> Start
+                    </button>
+                    <button id="stop-btn" class="btn btn-danger" disabled>
+                        <span class="icon">⏹</span> Stop
+                    </button>
+                </div>
+            </section>
+
+            <!-- Status Bar -->
+            <section class="status-bar" id="status-bar">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">Ready</span>
+                <span id="duration"></span>
+            </section>
+
+            <!-- Transcript Area -->
+            <section class="transcript-section">
+                <div class="transcript-header">
+                    <h2>Transcript</h2>
+                    <div class="transcript-actions">
+                        <button id="copy-btn" class="btn btn-small" title="Copy to clipboard">
+                            📋 Copy
+                        </button>
+                        <button id="download-btn" class="btn btn-small" title="Download transcript">
+                            💾 Download
+                        </button>
+                        <button id="clear-btn" class="btn btn-small" title="Clear transcript">
+                            🗑️ Clear
+                        </button>
+                    </div>
+                </div>
+                <div class="transcript-content" id="transcript">
+                    <p class="placeholder">Transcription will appear here...</p>
+                </div>
+            </section>
+
+            <!-- Model Loading Indicator -->
+            <div id="loading-overlay" class="loading-overlay hidden">
+                <div class="loading-content">
+                    <div class="spinner"></div>
+                    <p>Loading Whisper model...</p>
+                    <p class="loading-hint">This may take a minute on first run</p>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>Running locally • No data leaves your computer</p>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

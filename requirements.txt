@@ -1,0 +1,11 @@
+# Speech-to-text dependencies
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Web server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# WebSocket support
+websockets>=12.0
