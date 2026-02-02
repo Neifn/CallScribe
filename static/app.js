@@ -300,7 +300,7 @@ class TranscriptionApp {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `transcript_${new Date().toISOString().slice(0, 10)}.txt`;
+        a.download = `transcript_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')}.txt`;
         a.click();
         URL.revokeObjectURL(url);
     }

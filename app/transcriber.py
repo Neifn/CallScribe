@@ -1,4 +1,5 @@
 """Transcription module using faster-whisper."""
+import logging
 import threading
 import queue
 from datetime import datetime, timedelta
@@ -6,6 +7,8 @@ from typing import Optional, List, Callable
 import numpy as np
 from faster_whisper import WhisperModel
 from . import config
+
+logger = logging.getLogger(__name__)
 
 
 class TranscriptSegment:
@@ -40,7 +43,7 @@ class Transcriber:
         
         # Transcription state
         self._segments: List[TranscriptSegment] = []
-        self._current_offset = 0.0  # Time offset for continuous transcription
+        self._current_offset = 0.0
         
         # Threading
         self._transcription_queue: queue.Queue = queue.Queue()
@@ -48,13 +51,13 @@ class Transcriber:
         self._running = False
         self._on_segment: Optional[Callable[[TranscriptSegment], None]] = None
     
-    def load_model(self):
+    def load_model(self) -> None:
         """Load the Whisper model (can take a few seconds)."""
         if self._model is not None or self._loading:
             return
         
         self._loading = True
-        print(f"Loading Whisper model '{self.model_size}'...")
+        logger.info(f"Loading Whisper model '{self.model_size}' with compute type '{config.COMPUTE_TYPE}'...")
         
         self._model = WhisperModel(
             self.model_size,
@@ -65,17 +68,20 @@ class Transcriber:
         
         self._is_ready = True
         self._loading = False
-        print(f"Model loaded successfully!")
+        logger.info("Model loaded successfully!")
     
-    def set_language(self, language: str):
+    def set_language(self, language: str) -> None:
         """Set the transcription language."""
+        if language not in config.LANGUAGES and language != 'auto':
+            logger.warning(f"Unknown language '{language}', defaulting to English")
+            language = 'en'
         self.language = language if language != 'auto' else None
     
-    def set_segment_callback(self, callback: Callable[[TranscriptSegment], None]):
+    def set_segment_callback(self, callback: Callable[[TranscriptSegment], None]) -> None:
         """Set callback for when a new segment is transcribed."""
         self._on_segment = callback
     
-    def _transcription_worker(self):
+    def _transcription_worker(self) -> None:
         """Background worker that processes audio chunks."""
         while self._running:
             try:
@@ -90,8 +96,8 @@ class Transcriber:
                 segments, info = self._model.transcribe(
                     audio_chunk,
                     language=self.language,
-                    beam_size=8,  # Increased for better accuracy
-                    vad_filter=True,  # Filter out non-speech
+                    beam_size=8,
+                    vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=500)
                 )
                 
@@ -111,11 +117,11 @@ class Transcriber:
                 self._current_offset += len(audio_chunk) / config.SAMPLE_RATE
                 
             except Exception as e:
-                print(f"Transcription error: {e}")
+                logger.error(f"Transcription error: {e}", exc_info=True)
             
             self._transcription_queue.task_done()
     
-    def start(self):
+    def start(self) -> None:
         """Start the transcription worker."""
         if self._running:
             return
@@ -129,6 +135,7 @@ class Transcriber:
         
         self._worker_thread = threading.Thread(target=self._transcription_worker, daemon=True)
         self._worker_thread.start()
+        logger.info("Transcription worker started")
     
     def stop(self) -> List[TranscriptSegment]:
         """Stop transcription and return all segments."""
@@ -141,9 +148,10 @@ class Transcriber:
             self._worker_thread.join(timeout=5.0)
             self._worker_thread = None
         
+        logger.info(f"Transcription stopped, {len(self._segments)} segments collected")
         return self._segments
     
-    def transcribe_chunk(self, audio: np.ndarray):
+    def transcribe_chunk(self, audio: np.ndarray) -> None:
         """Queue an audio chunk for transcription."""
         if self._running and self._is_ready:
             self._transcription_queue.put(audio)

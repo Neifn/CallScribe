@@ -1,9 +1,10 @@
 """FastAPI application for the transcription service."""
 import asyncio
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -14,6 +15,12 @@ from . import config
 from .audio_capture import AudioCapture
 from .transcriber import Transcriber, TranscriptSegment
 
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Global state
 audio_capture: Optional[AudioCapture] = None
@@ -25,21 +32,19 @@ session_start_time: Optional[datetime] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    # Preload model on startup
     global transcriber
     transcriber = Transcriber()
-    # Load in background to not block startup
     asyncio.get_event_loop().run_in_executor(None, transcriber.load_model)
+    logger.info("Application started")
     yield
-    # Cleanup on shutdown
     if audio_capture and audio_capture.is_recording:
         audio_capture.stop()
     if transcriber and transcriber.is_running:
         transcriber.stop()
+    logger.info("Application shutdown")
 
 
-app = FastAPI(title="Call Transcription", lifespan=lifespan)
-
+app = FastAPI(title="CallScribe", lifespan=lifespan)
 
 # Mount static files
 static_dir = Path(__file__).parent.parent / "static"
@@ -48,16 +53,16 @@ if static_dir.exists():
 
 
 @app.get("/")
-async def root():
+async def root() -> FileResponse:
     """Serve the main UI."""
     index_path = static_dir / "index.html"
     if index_path.exists():
         return FileResponse(index_path)
-    return {"message": "Call Transcription API", "docs": "/docs"}
+    return JSONResponse({"message": "CallScribe API", "docs": "/docs"})
 
 
 @app.get("/api/devices")
-async def list_devices():
+async def list_devices() -> Dict[str, Any]:
     """List available audio input devices."""
     devices = AudioCapture.list_devices()
     blackhole_id = AudioCapture.find_blackhole_device()
@@ -68,13 +73,13 @@ async def list_devices():
 
 
 @app.get("/api/languages")
-async def list_languages():
+async def list_languages() -> Dict[str, Any]:
     """List supported languages."""
     return {"languages": config.LANGUAGES, "default": config.DEFAULT_LANGUAGE}
 
 
 @app.get("/api/status")
-async def get_status():
+async def get_status() -> Dict[str, Any]:
     """Get current transcription status."""
     return {
         "is_recording": audio_capture.is_recording if audio_capture else False,
@@ -85,9 +90,16 @@ async def get_status():
 
 
 @app.post("/api/start")
-async def start_transcription(device_id: Optional[int] = None, language: str = "auto"):
+async def start_transcription(device_id: Optional[int] = None, language: str = "en") -> Dict[str, Any]:
     """Start a new transcription session."""
     global audio_capture, transcriber, session_start_time
+    
+    # Validate language
+    if language not in config.LANGUAGES:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported language '{language}'. Supported: {list(config.LANGUAGES.keys())}"
+        )
     
     if audio_capture and audio_capture.is_recording:
         raise HTTPException(status_code=400, detail="Already recording")
@@ -118,7 +130,6 @@ async def start_transcription(device_id: Optional[int] = None, language: str = "
         transcriber.transcribe_chunk(audio)
     
     def on_segment(segment: TranscriptSegment):
-        # Broadcast to all connected websockets
         asyncio.run(broadcast_segment(segment))
     
     audio_capture.set_chunk_callback(on_audio_chunk)
@@ -129,21 +140,29 @@ async def start_transcription(device_id: Optional[int] = None, language: str = "
     audio_capture.start()
     session_start_time = datetime.now()
     
+    logger.info(f"Started transcription: device={device_id}, language={language}")
     return {"status": "started", "device_id": device_id, "language": language}
 
 
-async def broadcast_segment(segment: TranscriptSegment):
+async def broadcast_segment(segment: TranscriptSegment) -> None:
     """Send a segment to all connected WebSocket clients."""
     message = json.dumps(segment.to_dict())
-    for ws in active_websockets[:]:
+    disconnected = []
+    for ws in active_websockets:
         try:
             await ws.send_text(message)
-        except:
+        except (WebSocketDisconnect, RuntimeError) as e:
+            logger.debug(f"WebSocket disconnected: {e}")
+            disconnected.append(ws)
+    
+    # Clean up disconnected sockets
+    for ws in disconnected:
+        if ws in active_websockets:
             active_websockets.remove(ws)
 
 
 @app.post("/api/stop")
-async def stop_transcription(save: bool = True):
+async def stop_transcription(save: bool = True) -> Dict[str, Any]:
     """Stop transcription and optionally save the transcript."""
     global audio_capture, session_start_time
     
@@ -190,13 +209,15 @@ async def stop_transcription(save: bool = True):
             "srt": str(srt_path),
             "json": str(json_path)
         }
+        
+        logger.info(f"Saved transcript to {txt_path}")
     
     session_start_time = None
     return result
 
 
 @app.get("/api/transcript")
-async def get_current_transcript():
+async def get_current_transcript() -> Dict[str, Any]:
     """Get the current transcript (during or after recording)."""
     if not transcriber:
         return {"transcript": "", "segments": []}
@@ -208,10 +229,11 @@ async def get_current_transcript():
 
 
 @app.websocket("/ws/transcription")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket for real-time transcription updates."""
     await websocket.accept()
     active_websockets.append(websocket)
+    logger.debug("WebSocket client connected")
     
     try:
         # Send current segments first
@@ -222,20 +244,20 @@ async def websocket_endpoint(websocket: WebSocket):
         # Keep connection alive
         while True:
             try:
-                # Wait for any message (ping/pong or close)
                 await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                # Send ping to keep alive
                 await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
-        pass
+        logger.debug("WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
     finally:
         if websocket in active_websockets:
             active_websockets.remove(websocket)
 
 
 @app.get("/api/transcripts")
-async def list_saved_transcripts():
+async def list_saved_transcripts() -> Dict[str, Any]:
     """List all saved transcripts."""
     transcripts = []
     for txt_file in config.TRANSCRIPTS_DIR.glob("transcript_*.txt"):

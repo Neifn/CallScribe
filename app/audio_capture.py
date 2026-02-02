@@ -1,10 +1,12 @@
 """Audio capture module for recording from BlackHole or other audio devices."""
+import logging
 import threading
-import queue
 import numpy as np
 import sounddevice as sd
 from typing import Optional, List, Callable
 from . import config
+
+logger = logging.getLogger(__name__)
 
 
 class AudioCapture:
@@ -17,11 +19,11 @@ class AudioCapture:
         self.chunk_duration = config.CHUNK_DURATION
         
         self._stream: Optional[sd.InputStream] = None
-        self._audio_queue: queue.Queue = queue.Queue()
         self._is_recording = False
         self._buffer: List[np.ndarray] = []
         self._buffer_lock = threading.Lock()
         self._on_chunk_ready: Optional[Callable[[np.ndarray], None]] = None
+        self._device_channels: int = 1
     
     @staticmethod
     def list_devices() -> List[dict]:
@@ -50,14 +52,14 @@ class AudioCapture:
                 return device['id']
         return None
     
-    def set_chunk_callback(self, callback: Callable[[np.ndarray], None]):
+    def set_chunk_callback(self, callback: Callable[[np.ndarray], None]) -> None:
         """Set callback to be called when a chunk is ready for transcription."""
         self._on_chunk_ready = callback
     
-    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
+    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         """Callback for audio stream - called for each audio block."""
         if status:
-            print(f"Audio status: {status}")
+            logger.warning(f"Audio status: {status}")
         
         # Convert stereo to mono if needed (Whisper expects mono)
         if indata.ndim > 1 and indata.shape[1] > 1:
@@ -79,15 +81,15 @@ class AudioCapture:
                 audio_chunk = np.concatenate(self._buffer, axis=0)
                 self._buffer = []
                 
-                # Debug: check audio levels
+                # Log audio level for debugging
                 max_level = np.max(np.abs(audio_chunk))
-                print(f"[Audio] Chunk ready: {len(audio_chunk)} samples, max level: {max_level:.4f}")
+                logger.debug(f"Chunk ready: {len(audio_chunk)} samples, max level: {max_level:.4f}")
                 
                 # Notify callback
                 if self._on_chunk_ready:
                     self._on_chunk_ready(audio_chunk)
     
-    def start(self):
+    def start(self) -> None:
         """Start recording audio."""
         if self._is_recording:
             return
@@ -106,13 +108,13 @@ class AudioCapture:
         
         self._stream = sd.InputStream(
             device=self.device_id,
-            channels=device_channels,  # Use device's native channels
+            channels=device_channels,
             samplerate=self.sample_rate,
             callback=self._audio_callback,
             dtype=np.float32
         )
         self._stream.start()
-        print(f"Started recording from device {self.device_id} ({device_channels} channels)")
+        logger.info(f"Started recording from device {self.device_id} ({device_channels} channels)")
     
     def stop(self) -> Optional[np.ndarray]:
         """Stop recording and return any remaining audio."""
@@ -131,8 +133,10 @@ class AudioCapture:
             if self._buffer:
                 remaining = np.concatenate(self._buffer, axis=0).flatten()
                 self._buffer = []
+                logger.info("Stopped recording, returning remaining audio")
                 return remaining
         
+        logger.info("Stopped recording")
         return None
     
     @property
