@@ -133,6 +133,9 @@ class TranscriptionApp {
             this.segments = [];
             this.clearTranscript();
 
+            // Show processing indicator
+            this.showProcessingIndicator();
+
             // Update UI
             this.stopBtn.disabled = false;
             this.deviceSelect.disabled = true;
@@ -202,6 +205,22 @@ class TranscriptionApp {
             // Ignore ping messages
             if (data.type === 'ping') return;
 
+            // Handle status updates
+            if (data.type === 'status') {
+                if (data.status === 'stopping') {
+                    this.setStatus('processing', 'Finalizing transcription...');
+                }
+                return;
+            }
+
+            // Handle queue updates
+            if (data.type === 'queue') {
+                if (data.count > 0 && !this.isRecording) {
+                    this.setStatus('processing', `Finishing up... ${data.count} chunks remaining`);
+                }
+                return;
+            }
+
             // Add segment
             this.addSegment(data);
         };
@@ -218,11 +237,12 @@ class TranscriptionApp {
     addSegment(segment) {
         this.segments.push(segment);
 
-        // Remove placeholder if present
+        // Remove placeholder and processing indicator if present
         const placeholder = this.transcriptEl.querySelector('.placeholder');
         if (placeholder) {
             placeholder.remove();
         }
+        this.hideProcessingIndicator();
 
         // Create segment element
         const segmentEl = document.createElement('div');
@@ -308,6 +328,36 @@ class TranscriptionApp {
     clearTranscript() {
         this.segments = [];
         this.transcriptEl.innerHTML = '<p class="placeholder">Transcription will appear here...</p>';
+    }
+
+    showProcessingIndicator() {
+        // Remove placeholder
+        const placeholder = this.transcriptEl.querySelector('.placeholder');
+        if (placeholder) {
+            placeholder.remove();
+        }
+
+        // Add processing indicator if not already present
+        if (!this.transcriptEl.querySelector('.processing-indicator')) {
+            const indicator = document.createElement('div');
+            indicator.className = 'processing-indicator';
+            indicator.innerHTML = `
+                <div class="processing-dots">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+                <span class="processing-text">Listening and processing audio...</span>
+            `;
+            this.transcriptEl.appendChild(indicator);
+        }
+    }
+
+    hideProcessingIndicator() {
+        const indicator = this.transcriptEl.querySelector('.processing-indicator');
+        if (indicator) {
+            indicator.remove();
+        }
     }
 }
 

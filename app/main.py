@@ -27,12 +27,14 @@ audio_capture: Optional[AudioCapture] = None
 transcriber: Optional[Transcriber] = None
 active_websockets: list[WebSocket] = []
 session_start_time: Optional[datetime] = None
+main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    global transcriber
+    global transcriber, main_loop
+    main_loop = asyncio.get_running_loop()
     transcriber = Transcriber()
     asyncio.get_event_loop().run_in_executor(None, transcriber.load_model)
     logger.info("Application started")
@@ -42,6 +44,23 @@ async def lifespan(app: FastAPI):
     if transcriber and transcriber.is_running:
         transcriber.stop()
     logger.info("Application shutdown")
+
+# ... (lines omitted)
+
+    # Set up the pipeline: audio -> transcriber -> websocket
+    def on_audio_chunk(audio):
+        transcriber.transcribe_chunk(audio)
+    
+    def on_segment(segment: TranscriptSegment):
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_segment(segment), main_loop)
+        
+    def on_queue_update(count: int):
+        # Broadcast queue size
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_message({"type": "queue", "count": count}), main_loop)
+    
+    audio_capture.set_chunk_callback(on_audio_chunk)
 
 
 app = FastAPI(title="CallScribe", lifespan=lifespan)
@@ -126,14 +145,22 @@ async def start_transcription(device_id: Optional[int] = None, language: str = "
         transcriber.load_model()
     
     # Set up the pipeline: audio -> transcriber -> websocket
+    # Set up the pipeline: audio -> transcriber -> websocket
     def on_audio_chunk(audio):
         transcriber.transcribe_chunk(audio)
     
     def on_segment(segment: TranscriptSegment):
-        asyncio.run(broadcast_segment(segment))
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_segment(segment), main_loop)
+        
+    def on_queue_update(count: int):
+        # Broadcast queue size
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_message({"type": "queue", "count": count}), main_loop)
     
     audio_capture.set_chunk_callback(on_audio_chunk)
     transcriber.set_segment_callback(on_segment)
+    transcriber.set_queue_callback(on_queue_update)
     
     # Start components
     transcriber.start()
@@ -146,7 +173,12 @@ async def start_transcription(device_id: Optional[int] = None, language: str = "
 
 async def broadcast_segment(segment: TranscriptSegment) -> None:
     """Send a segment to all connected WebSocket clients."""
-    message = json.dumps(segment.to_dict())
+    await broadcast_message(segment.to_dict())
+
+
+async def broadcast_message(data: dict) -> None:
+    """Send a JSON message to all connected WebSocket clients."""
+    message = json.dumps(data)
     disconnected = []
     for ws in active_websockets:
         try:
@@ -169,15 +201,20 @@ async def stop_transcription(save: bool = True) -> Dict[str, Any]:
     if not audio_capture or not audio_capture.is_recording:
         raise HTTPException(status_code=400, detail="Not recording")
     
-    # Stop recording
+    # Signal busy state to UI via WS
+    await broadcast_message({"type": "status", "status": "stopping"})
+    
+    # Stop recording immediately
     remaining_audio = audio_capture.stop()
     
     # Process any remaining audio
     if remaining_audio is not None and len(remaining_audio) > 0:
         transcriber.transcribe_chunk(remaining_audio)
     
-    # Get final transcript
-    segments = transcriber.stop()
+    # Get final transcript - run in executor to avoid blocking WS updates
+    # This allows on_queue_update to keep firing while we wait for the queue to drain
+    segments = await asyncio.get_event_loop().run_in_executor(None, transcriber.stop)
+    
     full_text = transcriber.get_full_transcript()
     srt_content = transcriber.export_srt()
     

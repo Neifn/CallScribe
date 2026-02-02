@@ -50,6 +50,7 @@ class Transcriber:
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
         self._on_segment: Optional[Callable[[TranscriptSegment], None]] = None
+        self._on_queue_update: Optional[Callable[[int], None]] = None
     
     def load_model(self) -> None:
         """Load the Whisper model (can take a few seconds)."""
@@ -81,14 +82,23 @@ class Transcriber:
         """Set callback for when a new segment is transcribed."""
         self._on_segment = callback
     
+    def set_queue_callback(self, callback: Callable[[int], None]) -> None:
+        """Set callback for queue size updates."""
+        self._on_queue_update = callback
+    
     def _transcription_worker(self) -> None:
         """Background worker that processes audio chunks."""
-        while self._running:
+        while True:
             try:
+                # Get chunk
                 audio_chunk = self._transcription_queue.get(timeout=0.5)
             except queue.Empty:
+                if not self._running:
+                    # If stopped and queue empty, break
+                    break
                 continue
             
+            # Sentinel to stop
             if audio_chunk is None:
                 break
             
@@ -120,6 +130,10 @@ class Transcriber:
                 logger.error(f"Transcription error: {e}", exc_info=True)
             
             self._transcription_queue.task_done()
+            
+            # Notify queue size update
+            if self._on_queue_update:
+                self._on_queue_update(self._transcription_queue.qsize())
     
     def start(self) -> None:
         """Start the transcription worker."""
@@ -141,11 +155,17 @@ class Transcriber:
         """Stop transcription and return all segments."""
         self._running = False
         
-        # Signal worker to stop
+        # Signal worker to stop (will process queue first)
         self._transcription_queue.put(None)
         
+        # Notify queue size (add pending stop sentinel)
+        if self._on_queue_update:
+            self._on_queue_update(self._transcription_queue.qsize())
+        
         if self._worker_thread:
-            self._worker_thread.join(timeout=5.0)
+            # Wait for worker to finish (processing remainder of queue)
+            # Remove timeout to ensure everything is processed
+            self._worker_thread.join()
             self._worker_thread = None
         
         logger.info(f"Transcription stopped, {len(self._segments)} segments collected")
@@ -153,8 +173,11 @@ class Transcriber:
     
     def transcribe_chunk(self, audio: np.ndarray) -> None:
         """Queue an audio chunk for transcription."""
-        if self._running and self._is_ready:
+        if self._is_ready:
             self._transcription_queue.put(audio)
+            # Notify queue size
+            if self._on_queue_update:
+                self._on_queue_update(self._transcription_queue.qsize())
     
     def get_full_transcript(self) -> str:
         """Get the full transcript as a single string."""
