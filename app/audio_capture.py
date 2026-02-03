@@ -1,29 +1,31 @@
-"""Audio capture module for recording from BlackHole or other audio devices."""
+"""Audio capture module for recording to WAV files."""
 import logging
+import tempfile
 import threading
+from pathlib import Path
+from typing import Optional, List
 import numpy as np
 import sounddevice as sd
-from typing import Optional, List, Callable
+import soundfile as sf
 from . import config
 
 logger = logging.getLogger(__name__)
 
 
 class AudioCapture:
-    """Captures audio from a specified input device."""
+    """Captures audio from a specified input device and saves to WAV file."""
     
     def __init__(self, device_id: Optional[int] = None):
         self.device_id = device_id
         self.sample_rate = config.SAMPLE_RATE
         self.channels = config.CHANNELS
-        self.chunk_duration = config.CHUNK_DURATION
         
         self._stream: Optional[sd.InputStream] = None
         self._is_recording = False
-        self._buffer: List[np.ndarray] = []
-        self._buffer_lock = threading.Lock()
-        self._on_chunk_ready: Optional[Callable[[np.ndarray], None]] = None
+        self._wav_file: Optional[sf.SoundFile] = None
+        self._temp_file_path: Optional[Path] = None
         self._device_channels: int = 1
+        self._lock = threading.Lock()
     
     @staticmethod
     def list_devices() -> List[dict]:
@@ -52,50 +54,41 @@ class AudioCapture:
                 return device['id']
         return None
     
-    def set_chunk_callback(self, callback: Callable[[np.ndarray], None]) -> None:
-        """Set callback to be called when a chunk is ready for transcription."""
-        self._on_chunk_ready = callback
-    
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        """Callback for audio stream - called for each audio block."""
+        """Callback for audio stream - writes to WAV file."""
         if status:
             logger.warning(f"Audio status: {status}")
         
+        if not self._wav_file:
+            return
+        
         # Convert stereo to mono if needed (Whisper expects mono)
         if indata.ndim > 1 and indata.shape[1] > 1:
-            audio_data = np.mean(indata, axis=1)
+            audio_data = np.mean(indata, axis=1, keepdims=True)
         else:
-            audio_data = indata.flatten()
+            audio_data = indata
         
-        # Add to buffer
-        with self._buffer_lock:
-            self._buffer.append(audio_data.copy())
-            
-            # Calculate total duration in buffer
-            total_samples = sum(chunk.shape[0] for chunk in self._buffer)
-            duration = total_samples / self.sample_rate
-            
-            # If we have enough audio, trigger transcription
-            if duration >= self.chunk_duration:
-                # Concatenate buffer
-                audio_chunk = np.concatenate(self._buffer, axis=0)
-                self._buffer = []
-                
-                # Log audio level for debugging
-                max_level = np.max(np.abs(audio_chunk))
-                logger.debug(f"Chunk ready: {len(audio_chunk)} samples, max level: {max_level:.4f}")
-                
-                # Notify callback
-                if self._on_chunk_ready:
-                    self._on_chunk_ready(audio_chunk)
+        # Write to WAV file
+        with self._lock:
+            try:
+                self._wav_file.write(audio_data)
+            except Exception as e:
+                logger.error(f"Error writing audio: {e}")
     
     def start(self) -> None:
-        """Start recording audio."""
+        """Start recording audio to a temporary WAV file."""
         if self._is_recording:
             return
         
-        self._is_recording = True
-        self._buffer = []
+        # Create temporary WAV file
+        temp_file = tempfile.NamedTemporaryFile(
+            mode='wb',
+            suffix='.wav',
+            dir=str(config.TEMP_AUDIO_DIR),
+            delete=False
+        )
+        self._temp_file_path = Path(temp_file.name)
+        temp_file.close()
         
         # Query the device to get its actual channel count
         if self.device_id is not None:
@@ -106,6 +99,17 @@ class AudioCapture:
         
         self._device_channels = device_channels
         
+        # Open WAV file for writing (mono output for Whisper)
+        self._wav_file = sf.SoundFile(
+            str(self._temp_file_path),
+            mode='w',
+            samplerate=self.sample_rate,
+            channels=1,  # Write as mono
+            format='WAV',
+            subtype='PCM_16'
+        )
+        
+        # Start audio stream
         self._stream = sd.InputStream(
             device=self.device_id,
             channels=device_channels,
@@ -114,29 +118,38 @@ class AudioCapture:
             dtype=np.float32
         )
         self._stream.start()
-        logger.info(f"Started recording from device {self.device_id} ({device_channels} channels)")
+        self._is_recording = True
+        
+        logger.info(f"Started recording to {self._temp_file_path} from device {self.device_id} ({device_channels} channels)")
     
-    def stop(self) -> Optional[np.ndarray]:
-        """Stop recording and return any remaining audio."""
+    def stop(self) -> Optional[Path]:
+        """Stop recording and return the path to the WAV file."""
         if not self._is_recording:
             return None
         
         self._is_recording = False
         
+        # Stop and close stream
         if self._stream:
             self._stream.stop()
             self._stream.close()
             self._stream = None
         
-        # Return any remaining audio in buffer
-        with self._buffer_lock:
-            if self._buffer:
-                remaining = np.concatenate(self._buffer, axis=0).flatten()
-                self._buffer = []
-                logger.info("Stopped recording, returning remaining audio")
-                return remaining
+        # Close WAV file
+        with self._lock:
+            if self._wav_file:
+                self._wav_file.close()
+                self._wav_file = None
         
-        logger.info("Stopped recording")
+        temp_path = self._temp_file_path
+        self._temp_file_path = None
+        
+        if temp_path and temp_path.exists():
+            file_size = temp_path.stat().st_size
+            logger.info(f"Stopped recording, saved {file_size} bytes to {temp_path}")
+            return temp_path
+        
+        logger.warning("Stopped recording but no file was created")
         return None
     
     @property

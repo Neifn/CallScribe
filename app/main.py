@@ -35,32 +35,31 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     global transcriber, main_loop
     main_loop = asyncio.get_running_loop()
+    
+    # Initialize transcriber and preload default model
     transcriber = Transcriber()
-    asyncio.get_event_loop().run_in_executor(None, transcriber.load_model)
+    logger.info("Preloading default model...")
+    asyncio.get_event_loop().run_in_executor(
+        None, 
+        transcriber.preload_model, 
+        config.DEFAULT_LANGUAGE
+    )
+    
     logger.info("Application started")
     yield
+    
+    # Cleanup
     if audio_capture and audio_capture.is_recording:
         audio_capture.stop()
-    if transcriber and transcriber.is_running:
-        transcriber.stop()
+    
+    # Clean up temp files
+    for temp_file in config.TEMP_AUDIO_DIR.glob("*.wav"):
+        try:
+            temp_file.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to delete temp file {temp_file}: {e}")
+    
     logger.info("Application shutdown")
-
-# ... (lines omitted)
-
-    # Set up the pipeline: audio -> transcriber -> websocket
-    def on_audio_chunk(audio):
-        transcriber.transcribe_chunk(audio)
-    
-    def on_segment(segment: TranscriptSegment):
-        if main_loop and main_loop.is_running():
-            asyncio.run_coroutine_threadsafe(broadcast_segment(segment), main_loop)
-        
-    def on_queue_update(count: int):
-        # Broadcast queue size
-        if main_loop and main_loop.is_running():
-            asyncio.run_coroutine_threadsafe(broadcast_message({"type": "queue", "count": count}), main_loop)
-    
-    audio_capture.set_chunk_callback(on_audio_chunk)
 
 
 app = FastAPI(title="CallScribe", lifespan=lifespan)
@@ -104,13 +103,13 @@ async def get_status() -> Dict[str, Any]:
         "is_recording": audio_capture.is_recording if audio_capture else False,
         "is_model_ready": transcriber.is_ready if transcriber else False,
         "session_start": session_start_time.isoformat() if session_start_time else None,
-        "segments_count": len(transcriber._segments) if transcriber else 0
+        "segments_count": len(transcriber.segments) if transcriber else 0
     }
 
 
 @app.post("/api/start")
 async def start_transcription(device_id: Optional[int] = None, language: str = "en") -> Dict[str, Any]:
-    """Start a new transcription session."""
+    """Start a new recording session."""
     global audio_capture, transcriber, session_start_time
     
     # Validate language
@@ -132,43 +131,27 @@ async def start_transcription(device_id: Optional[int] = None, language: str = "
                 detail="BlackHole not found. Please install it or specify a device_id."
             )
     
-    # Initialize components
+    # Initialize audio capture
     audio_capture = AudioCapture(device_id=device_id)
     
+    # Set language for transcriber
     if transcriber is None:
-        transcriber = Transcriber(language=language)
-    else:
-        transcriber.set_language(language)
+        transcriber = Transcriber()
+    transcriber.set_language(language)
     
-    # Ensure model is loaded
-    if not transcriber.is_ready:
-        transcriber.load_model()
+    # Preload model for this language in background
+    asyncio.get_event_loop().run_in_executor(
+        None,
+        transcriber.preload_model,
+        language
+    )
     
-    # Set up the pipeline: audio -> transcriber -> websocket
-    # Set up the pipeline: audio -> transcriber -> websocket
-    def on_audio_chunk(audio):
-        transcriber.transcribe_chunk(audio)
-    
-    def on_segment(segment: TranscriptSegment):
-        if main_loop and main_loop.is_running():
-            asyncio.run_coroutine_threadsafe(broadcast_segment(segment), main_loop)
-        
-    def on_queue_update(count: int):
-        # Broadcast queue size
-        if main_loop and main_loop.is_running():
-            asyncio.run_coroutine_threadsafe(broadcast_message({"type": "queue", "count": count}), main_loop)
-    
-    audio_capture.set_chunk_callback(on_audio_chunk)
-    transcriber.set_segment_callback(on_segment)
-    transcriber.set_queue_callback(on_queue_update)
-    
-    # Start components
-    transcriber.start()
+    # Start recording
     audio_capture.start()
     session_start_time = datetime.now()
     
-    logger.info(f"Started transcription: device={device_id}, language={language}")
-    return {"status": "started", "device_id": device_id, "language": language}
+    logger.info(f"Started recording: device={device_id}, language={language}")
+    return {"status": "recording", "device_id": device_id, "language": language}
 
 
 async def broadcast_segment(segment: TranscriptSegment) -> None:
@@ -193,109 +176,137 @@ async def broadcast_message(data: dict) -> None:
             active_websockets.remove(ws)
 
 
-async def _perform_stop(save: bool = True) -> Dict[str, Any]:
-    """Internal stop logic reusable by endpoint and cleanup."""
-    global audio_capture, session_start_time
-    
-    if not audio_capture or not audio_capture.is_recording:
-        raise HTTPException(status_code=400, detail="Not recording")
-    
-    # Signal busy state to UI via WS
-    await broadcast_message({"type": "status", "status": "stopping"})
-    
-    # Stop recording immediately
-    remaining_audio = audio_capture.stop()
-    
-    # Process any remaining audio
-    if remaining_audio is not None and len(remaining_audio) > 0:
-        transcriber.transcribe_chunk(remaining_audio)
-    
-    # Get final transcript - run in executor to avoid blocking WS updates
-    # This allows on_queue_update to keep firing while we wait for the queue to drain
-    segments = await asyncio.get_event_loop().run_in_executor(None, transcriber.stop)
-    
-    full_text = transcriber.get_full_transcript()
-    srt_content = transcriber.export_srt()
-    
-    result = {
-        "status": "stopped",
-        "duration": (datetime.now() - session_start_time).total_seconds() if session_start_time else 0,
-        "segments_count": len(segments),
-        "transcript": full_text
-    }
-    
-    # Save to file if requested
-    if save and segments:
-        timestamp = session_start_time.strftime("%Y%m%d_%H%M%S") if session_start_time else datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save as text
-        txt_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.txt"
-        txt_path.write_text(full_text)
-        
-        # Save as SRT
-        srt_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.srt"
-        srt_path.write_text(srt_content)
-        
-        # Save as JSON
-        json_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.json"
-        json_path.write_text(json.dumps([s.to_dict() for s in segments], indent=2))
-        
-        result["saved_files"] = {
-            "txt": str(txt_path),
-            "srt": str(srt_path),
-            "json": str(json_path)
-        }
-        
-        logger.info(f"Saved transcript to {txt_path}")
-    
-    session_start_time = None
-    return result
-
-
 @app.post("/api/stop")
 async def stop_transcription(save: bool = True) -> Dict[str, Any]:
-    """Stop transcription and optionally save the transcript."""
+    """Stop recording and transcribe the audio file."""
+    global audio_capture, session_start_time, transcriber
+    
     if not audio_capture or not audio_capture.is_recording:
         raise HTTPException(status_code=400, detail="Not recording")
-    return await _perform_stop(save)
+    
+    # Notify clients that processing is starting
+    await broadcast_message({"type": "status", "status": "processing"})
+    
+    # Stop recording and get audio file
+    audio_file = audio_capture.stop()
+    
+    if not audio_file or not audio_file.exists():
+        raise HTTPException(status_code=500, detail="Failed to save recording")
+    
+    try:
+        # Set up callbacks for real-time updates
+        def on_segment(segment: TranscriptSegment):
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(broadcast_segment(segment), main_loop)
+        
+        def on_progress(current: int, total: int):
+            if main_loop and main_loop.is_running():
+                progress_pct = int((current / total) * 100) if total > 0 else 0
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_message({
+                        "type": "progress", 
+                        "current": current, 
+                        "total": total,
+                        "percent": progress_pct
+                    }), 
+                    main_loop
+                )
+        
+        transcriber.set_segment_callback(on_segment)
+        transcriber.set_progress_callback(on_progress)
+        
+        # Transcribe in executor to avoid blocking
+        segments = await asyncio.get_event_loop().run_in_executor(
+            None,
+            transcriber.transcribe_file,
+            audio_file,
+            None  # Use language set in start()
+        )
+        
+        full_text = transcriber.get_full_transcript()
+        srt_content = transcriber.export_srt()
+        
+        result = {
+            "status": "completed",
+            "duration": (datetime.now() - session_start_time).total_seconds() if session_start_time else 0,
+            "segments_count": len(segments),
+            "transcript": full_text
+        }
+        
+        # Save to file if requested
+        if save and segments:
+            timestamp = session_start_time.strftime("%Y%m%d_%H%M%S") if session_start_time else datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Save as text
+            txt_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.txt"
+            txt_path.write_text(full_text)
+            
+            # Save as SRT
+            srt_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.srt"
+            srt_path.write_text(srt_content)
+            
+            # Save as JSON
+            json_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.json"
+            json_path.write_text(json.dumps([s.to_dict() for s in segments], indent=2))
+            
+            result["saved_files"] = {
+                "txt": str(txt_path),
+                "srt": str(srt_path),
+                "json": str(json_path)
+            }
+            
+            logger.info(f"Saved transcript to {txt_path}")
+        
+        # Notify completion
+        await broadcast_message({"type": "status", "status": "completed"})
+        
+        session_start_time = None
+        return result
+        
+    finally:
+        # Clean up temporary audio file
+        try:
+            if audio_file and audio_file.exists():
+                audio_file.unlink()
+                logger.info(f"Deleted temporary audio file: {audio_file}")
+        except Exception as e:
+            logger.warning(f"Failed to delete temp file {audio_file}: {e}")
 
 
-@app.post("/api/interrupt")
-async def interrupt_transcription() -> Dict[str, Any]:
-    """Immediately stop transcription, discarding pending audio."""
+@app.post("/api/cancel")
+async def cancel_recording() -> Dict[str, Any]:
+    """Cancel recording without transcribing."""
     global audio_capture, session_start_time
     
-    # Broadcast status
-    await broadcast_message({"type": "status", "status": "interrupted"})
+    if not audio_capture or not audio_capture.is_recording:
+        raise HTTPException(status_code=400, detail="Not recording")
     
-    # Stop recording if active
-    if audio_capture and audio_capture.is_recording:
-        audio_capture.stop()
-        # Ensure it's marked as stopped
-        audio_capture._recording = False 
+    # Stop recording
+    audio_file = audio_capture.stop()
     
-    # Force stop transcriber (clears queue)
-    if transcriber and transcriber.is_busy:
-        await asyncio.get_event_loop().run_in_executor(None, transcriber.force_stop)
-        
+    # Delete the temp file
+    if audio_file and audio_file.exists():
+        try:
+            audio_file.unlink()
+            logger.info(f"Deleted temporary audio file: {audio_file}")
+        except Exception as e:
+            logger.warning(f"Failed to delete temp file: {e}")
+    
     session_start_time = None
-    logger.warning("Transcription interrupted by user")
+    await broadcast_message({"type": "status", "status": "cancelled"})
     
-    # Small delay to ensure resources are freed
-    await asyncio.sleep(0.2)
-    
-    return {"status": "interrupted"}
+    return {"status": "cancelled"}
 
 
 @app.get("/api/transcript")
 async def get_current_transcript() -> Dict[str, Any]:
-    """Get the current transcript (during or after recording)."""
+    """Get the current transcript."""
     if not transcriber:
         return {"transcript": "", "segments": []}
     
     return {
         "transcript": transcriber.get_full_transcript(),
-        "segments": [s.to_dict() for s in transcriber._segments]
+        "segments": [s.to_dict() for s in transcriber.segments]
     }
 
 
@@ -307,9 +318,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     logger.debug("WebSocket client connected")
     
     try:
-        # Send current segments first
-        if transcriber and transcriber._segments:
-            for segment in transcriber._segments:
+        # Send current segments if any
+        if transcriber and transcriber.segments:
+            for segment in transcriber.segments:
                 await websocket.send_text(json.dumps(segment.to_dict()))
         
         # Keep connection alive
@@ -325,16 +336,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     finally:
         if websocket in active_websockets:
             active_websockets.remove(websocket)
-            
-        # If no clients left and recording is active, stop it
-        if not active_websockets and audio_capture and audio_capture.is_recording:
-            logger.info("All clients disconnected. Auto-stopping recording...")
-            # We use ensure_future because finally block might not allow await in some contexts 
-            # or we don't want to block closure. But here await is fine in async func.
-            try:
-                await _perform_stop(save=True)
-            except Exception as e:
-                logger.error(f"Error in auto-stop: {e}")
 
 
 @app.get("/api/transcripts")

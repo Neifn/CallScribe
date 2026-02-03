@@ -20,11 +20,11 @@ class TranscriptionApp {
 
         // State
         this.isRecording = false;
+        this.isProcessing = false;
         this.websocket = null;
         this.segments = [];
         this.startTime = null;
         this.durationInterval = null;
-        this.sessionId = 0; // Track sessions to avoid race conditions
 
         // Initialize
         this.init();
@@ -117,16 +117,6 @@ class TranscriptionApp {
             return;
         }
 
-        // Check if we need to interrupt existing finalization
-        if (this.stopBtn.disabled && this.isRecording) {
-            this.showInterruptModal();
-            return;
-        }
-
-        this.executeStart(deviceId, language);
-    }
-
-    async executeStart(deviceId, language) {
         try {
             this.startBtn.disabled = true;
 
@@ -140,13 +130,9 @@ class TranscriptionApp {
             }
 
             this.isRecording = true;
-            this.sessionId = Date.now(); // New session
             this.startTime = Date.now();
             this.segments = [];
             this.clearTranscript();
-
-            // Show processing indicator
-            this.showProcessingIndicator();
 
             // Update UI
             this.stopBtn.disabled = false;
@@ -158,7 +144,7 @@ class TranscriptionApp {
             if (this.durationInterval) clearInterval(this.durationInterval);
             this.durationInterval = setInterval(() => this.updateDuration(), 1000);
 
-            // Connect WebSocket for real-time updates
+            // Connect WebSocket for updates
             this.connectWebSocket();
 
         } catch (error) {
@@ -169,52 +155,45 @@ class TranscriptionApp {
     }
 
     async stopTranscription() {
+        if (!this.isRecording) return;
+
         // Stop timer immediately
         if (this.durationInterval) {
             clearInterval(this.durationInterval);
             this.durationInterval = null;
         }
 
-        const currentSession = this.sessionId;
-
         try {
             this.stopBtn.disabled = true;
-            this.startBtn.disabled = false; // Allow starting new one immediately (interrupt flow)
+            this.isProcessing = true;
+            this.setStatus('processing', 'Processing recording...');
 
             const response = await fetch('/api/stop?save=true', {
                 method: 'POST'
             });
 
-            // If session changed (interrupted), ignore this result
-            if (this.sessionId !== currentSession) return;
-
-            // If we were interrupted, this might return differently or throw
-            if (!response.ok) return;
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Failed to stop');
+            }
 
             const data = await response.json();
 
             this.isRecording = false;
+            this.isProcessing = false;
 
             // Update UI
+            this.startBtn.disabled = false;
             this.deviceSelect.disabled = false;
             this.languageSelect.disabled = false;
-
-            // Disconnect WebSocket
-            if (this.websocket) {
-                this.websocket.close();
-                this.websocket = null;
-            }
 
             this.setStatus('ready', `Saved! ${data.segments_count} segments transcribed`);
 
         } catch (error) {
-            // If session changed, ignore error
-            if (this.sessionId !== currentSession) return;
-
             console.error('Failed to stop:', error);
-            // Only show error if we weren't just interrupted
             this.setStatus('error', 'Failed to stop recording');
             this.stopBtn.disabled = false;
+            this.isProcessing = false;
         }
     }
 
@@ -237,22 +216,24 @@ class TranscriptionApp {
 
             // Handle status updates
             if (data.type === 'status') {
-                if (data.status === 'stopping') {
-                    this.setStatus('processing', 'Finalizing transcription...');
+                if (data.status === 'processing') {
+                    this.setStatus('processing', 'Processing recording...');
+                } else if (data.status === 'completed') {
+                    this.setStatus('ready', 'Transcription completed!');
                 }
                 return;
             }
 
-            // Handle queue updates
-            if (data.type === 'queue') {
-                if (data.count > 0 && !this.isRecording) {
-                    this.setStatus('processing', `Finishing up... ${data.count} chunks remaining`);
-                }
+            // Handle progress updates
+            if (data.type === 'progress') {
+                this.setStatus('processing', `Processing... ${data.percent}% (${data.current}/${data.total} segments)`);
                 return;
             }
 
             // Add segment
-            this.addSegment(data);
+            if (data.text) {
+                this.addSegment(data);
+            }
         };
 
         this.websocket.onerror = (error) => {
@@ -267,12 +248,11 @@ class TranscriptionApp {
     addSegment(segment) {
         this.segments.push(segment);
 
-        // Remove placeholder and processing indicator if present
+        // Remove placeholder if present
         const placeholder = this.transcriptEl.querySelector('.placeholder');
         if (placeholder) {
             placeholder.remove();
         }
-        this.hideProcessingIndicator();
 
         // Create segment element
         const segmentEl = document.createElement('div');
@@ -298,6 +278,8 @@ class TranscriptionApp {
             this.statusDot.classList.add('recording');
         } else if (type === 'ready') {
             this.statusDot.classList.add('ready');
+        } else if (type === 'processing') {
+            this.statusDot.classList.add('processing');
         }
         this.statusText.textContent = message;
     }
@@ -358,76 +340,6 @@ class TranscriptionApp {
     clearTranscript() {
         this.segments = [];
         this.transcriptEl.innerHTML = '<p class="placeholder">Transcription will appear here...</p>';
-    }
-
-    showProcessingIndicator() {
-        // Remove placeholder
-        const placeholder = this.transcriptEl.querySelector('.placeholder');
-        if (placeholder) {
-            placeholder.remove();
-        }
-
-        // Add processing indicator if not already present
-        if (!this.transcriptEl.querySelector('.processing-indicator')) {
-            const indicator = document.createElement('div');
-            indicator.className = 'processing-indicator';
-            indicator.innerHTML = `
-                <div class="processing-dots">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                </div>
-                <span class="processing-text">Listening and processing audio...</span>
-            `;
-            this.transcriptEl.appendChild(indicator);
-        }
-    }
-
-    hideProcessingIndicator() {
-        const indicator = this.transcriptEl.querySelector('.processing-indicator');
-        if (indicator) {
-            indicator.remove();
-        }
-    }
-
-    showInterruptModal() {
-        // Create modal if not exists
-        if (!document.getElementById('interrupt-modal')) {
-            const modal = document.createElement('div');
-            modal.id = 'interrupt-modal';
-            modal.className = 'modal-overlay';
-            modal.innerHTML = `
-                <div class="modal">
-                    <h3>Stop Finalization?</h3>
-                    <p>Transcription is still finalizing pending audio. Starting a new session will discard unprocessed audio.</p>
-                    <div class="modal-actions">
-                        <button id="modal-cancel-btn" class="btn btn-small">Cancel</button>
-                        <button id="modal-confirm-btn" class="btn btn-danger">Discard & Start New</button>
-                    </div>
-                </div>
-            `;
-            document.body.appendChild(modal);
-
-            // Bind events
-            document.getElementById('modal-cancel-btn').onclick = () => {
-                modal.remove();
-            };
-            document.getElementById('modal-confirm-btn').onclick = async () => {
-                modal.remove();
-                try {
-                    await fetch('/api/interrupt', { method: 'POST' });
-                    // Provide longer delay for backend to clear (500ms)
-                    setTimeout(() => {
-                        const deviceId = this.deviceSelect.value;
-                        const language = this.languageSelect.value;
-                        this.executeStart(deviceId, language);
-                    }, 500);
-                } catch (e) {
-                    console.error("Interrupt failed", e);
-                    this.setStatus('error', 'Failed to interrupt: ' + e.message);
-                }
-            };
-        }
     }
 }
 

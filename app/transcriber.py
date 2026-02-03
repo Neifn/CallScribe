@@ -1,9 +1,8 @@
 """Transcription module using faster-whisper."""
 import logging
-import threading
-import queue
 from datetime import datetime, timedelta
-from typing import Optional, List, Callable
+from pathlib import Path
+from typing import Optional, List, Callable, Dict
 import numpy as np
 from faster_whisper import WhisperModel
 from . import config
@@ -34,171 +33,120 @@ class TranscriptSegment:
 class Transcriber:
     """Speech-to-text transcription using faster-whisper."""
     
-    def __init__(self, model_size: str = config.MODEL_SIZE, language: str = config.DEFAULT_LANGUAGE):
-        self.model_size = model_size
-        self.language = language if language != 'auto' else None
-        self._model: Optional[WhisperModel] = None
-        self._is_ready = False
-        self._loading = False
-        
-        # Transcription state
+    def __init__(self):
+        self._models: Dict[str, WhisperModel] = {}  # Cache models by size
+        self._current_language: str = config.DEFAULT_LANGUAGE
         self._segments: List[TranscriptSegment] = []
-        self._current_offset = 0.0
-        
-        # Threading
-        self._transcription_queue: queue.Queue = queue.Queue()
-        self._worker_thread: Optional[threading.Thread] = None
-        self._running = False
         self._on_segment: Optional[Callable[[TranscriptSegment], None]] = None
-        self._on_queue_update: Optional[Callable[[int], None]] = None
+        self._on_progress: Optional[Callable[[int, int], None]] = None
     
-    def load_model(self) -> None:
-        """Load the Whisper model (can take a few seconds)."""
-        if self._model is not None or self._loading:
-            return
+    def get_model_for_language(self, language: str) -> WhisperModel:
+        """Get or load the appropriate model for the specified language."""
+        # Determine model size based on language
+        model_size = config.LANGUAGE_MODELS.get(language, config.MODEL_SIZE)
         
-        self._loading = True
-        logger.info(f"Loading Whisper model '{self.model_size}' with compute type '{config.COMPUTE_TYPE}'...")
+        # Check if model is already loaded
+        if model_size in self._models:
+            logger.info(f"Using cached model '{model_size}' for language '{language}'")
+            return self._models[model_size]
         
-        self._model = WhisperModel(
-            self.model_size,
+        # Load new model
+        logger.info(f"Loading Whisper model '{model_size}' for language '{language}' with compute type '{config.COMPUTE_TYPE}'...")
+        model = WhisperModel(
+            model_size,
             device="cpu",
             compute_type=config.COMPUTE_TYPE,
             download_root=str(config.MODELS_DIR)
         )
         
-        self._is_ready = True
-        self._loading = False
-        logger.info("Model loaded successfully!")
+        # Cache it
+        self._models[model_size] = model
+        logger.info(f"Model '{model_size}' loaded successfully!")
+        return model
     
     def set_language(self, language: str) -> None:
         """Set the transcription language."""
         if language not in config.LANGUAGES and language != 'auto':
             logger.warning(f"Unknown language '{language}', defaulting to English")
             language = 'en'
-        self.language = language if language != 'auto' else None
+        self._current_language = language
     
     def set_segment_callback(self, callback: Callable[[TranscriptSegment], None]) -> None:
         """Set callback for when a new segment is transcribed."""
         self._on_segment = callback
     
-    def set_queue_callback(self, callback: Callable[[int], None]) -> None:
-        """Set callback for queue size updates."""
-        self._on_queue_update = callback
-    
-    def _transcription_worker(self) -> None:
-        """Background worker that processes audio chunks."""
-        while True:
-            try:
-                # Get chunk
-                audio_chunk = self._transcription_queue.get(timeout=0.5)
-            except queue.Empty:
-                if not self._running:
-                    # If stopped and queue empty, break
-                    break
-                continue
-            
-            # Sentinel to stop
-            if audio_chunk is None:
-                break
-            
-            try:
-                segments, info = self._model.transcribe(
-                    audio_chunk,
-                    language=self.language,
-                    beam_size=8,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500)
-                )
-                
-                for segment in segments:
-                    ts = TranscriptSegment(
-                        text=segment.text.strip(),
-                        start=self._current_offset + segment.start,
-                        end=self._current_offset + segment.end,
-                        language=info.language
-                    )
-                    self._segments.append(ts)
-                    
-                    if self._on_segment and ts.text:
-                        self._on_segment(ts)
-                
-                # Update offset for next chunk
-                self._current_offset += len(audio_chunk) / config.SAMPLE_RATE
-                
-            except Exception as e:
-                logger.error(f"Transcription error: {e}", exc_info=True)
-            
-            self._transcription_queue.task_done()
-            
-            # Notify queue size update
-            if self._on_queue_update:
-                self._on_queue_update(self._transcription_queue.qsize())
-    
-    def start(self) -> None:
-        """Start the transcription worker."""
-        if self._running:
-            return
+    def set_progress_callback(self, callback: Callable[[int, int], None]) -> None:
+        """Set callback for progress updates during transcription.
         
-        if not self._is_ready:
-            self.load_model()
+        Args:
+            callback: Function that receives (current_segment, total_segments)
+        """
+        self._on_progress = callback
+    
+    def transcribe_file(self, audio_file: Path, language: Optional[str] = None) -> List[TranscriptSegment]:
+        """Transcribe a complete audio file.
         
-        self._running = True
+        Args:
+            audio_file: Path to the audio file (WAV format)
+            language: Language code or None for auto-detection
+            
+        Returns:
+            List of transcribed segments
+        """
+        if not audio_file.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_file}")
+        
+        # Use provided language or current language
+        lang = language or self._current_language
+        lang_code = lang if lang != 'auto' else None
+        
+        # Get appropriate model for this language
+        model = self.get_model_for_language(lang)
+        
+        # Clear previous segments
         self._segments = []
-        self._current_offset = 0.0
         
-        self._worker_thread = threading.Thread(target=self._transcription_worker, daemon=True)
-        self._worker_thread.start()
-        logger.info("Transcription worker started")
-    
-    def stop(self) -> List[TranscriptSegment]:
-        """Stop transcription and return all segments."""
-        self._running = False
+        logger.info(f"Starting transcription of {audio_file} (language: {lang})")
         
-        # Signal worker to stop (will process queue first)
-        self._transcription_queue.put(None)
+        # Transcribe the file
+        segments_iterator, info = model.transcribe(
+            str(audio_file),
+            language=lang_code,
+            beam_size=8,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            word_timestamps=False
+        )
         
-        # Notify queue size (add pending stop sentinel)
-        if self._on_queue_update:
-            self._on_queue_update(self._transcription_queue.qsize())
+        # Convert iterator to list to get total count
+        segments_list = list(segments_iterator)
+        total_segments = len(segments_list)
         
-        if self._worker_thread:
-            # Wait for worker to finish (processing remainder of queue)
-            # Remove timeout to ensure everything is processed
-            self._worker_thread.join()
-            self._worker_thread = None
+        logger.info(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
+        logger.info(f"Processing {total_segments} segments...")
         
-        logger.info(f"Transcription stopped, {len(self._segments)} segments collected")
-        return self._segments
-    
-    def force_stop(self) -> None:
-        """Immediately stop transcription, clearing the queue."""
-        self._running = False
-        
-        # Clear the queue
-        while not self._transcription_queue.empty():
-            try:
-                self._transcription_queue.get_nowait()
-            except queue.Empty:
-                break
-                
-        # Put sentinel
-        self._transcription_queue.put(None)
-        
-        if self._worker_thread:
-            # Wait briefly (should be fast since queue is empty)
-            self._worker_thread.join(timeout=1.0)
-            self._worker_thread = None
+        # Process segments
+        for idx, segment in enumerate(segments_list, 1):
+            ts = TranscriptSegment(
+                text=segment.text.strip(),
+                start=segment.start,
+                end=segment.end,
+                language=info.language
+            )
             
-        logger.warning("Transcription FORCE stopped")
-    
-    def transcribe_chunk(self, audio: np.ndarray) -> None:
-        """Queue an audio chunk for transcription."""
-        if self._is_ready:
-            self._transcription_queue.put(audio)
-            # Notify queue size
-            if self._on_queue_update:
-                self._on_queue_update(self._transcription_queue.qsize())
+            if ts.text:  # Only add non-empty segments
+                self._segments.append(ts)
+                
+                # Notify callback
+                if self._on_segment:
+                    self._on_segment(ts)
+            
+            # Notify progress
+            if self._on_progress:
+                self._on_progress(idx, total_segments)
+        
+        logger.info(f"Transcription complete: {len(self._segments)} segments")
+        return self._segments
     
     def get_full_transcript(self) -> str:
         """Get the full transcript as a single string."""
@@ -226,14 +174,15 @@ class Transcriber:
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
     
     @property
-    def is_ready(self) -> bool:
-        return self._is_ready
+    def segments(self) -> List[TranscriptSegment]:
+        """Get all transcribed segments."""
+        return self._segments
     
     @property
-    def is_running(self) -> bool:
-        return self._running
-
-    @property
-    def is_busy(self) -> bool:
-        """Check if transcription worker is active (running or draining)."""
-        return self._worker_thread is not None and self._worker_thread.is_alive()
+    def is_ready(self) -> bool:
+        """Check if at least one model is loaded."""
+        return len(self._models) > 0
+    
+    def preload_model(self, language: str) -> None:
+        """Preload model for a specific language."""
+        self.get_model_for_language(language)
