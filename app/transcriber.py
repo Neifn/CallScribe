@@ -108,14 +108,19 @@ class Transcriber:
         
         logger.info(f"Starting transcription of {audio_file} (language: {lang})")
         
-        # Transcribe the file
+        # Transcribe the file with accuracy optimizations
         segments_iterator, info = model.transcribe(
             str(audio_file),
             language=lang_code,
             beam_size=8,
+            best_of=8,  # Test multiple candidates for accuracy
+            temperature=0.0,  # Deterministic output
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            word_timestamps=False
+            vad_parameters=config.VAD_PARAMETERS,
+            word_timestamps=False,
+            condition_on_previous_text=True,  # Use context
+            compression_ratio_threshold=2.2,  # Detect gibberish
+            no_speech_threshold=0.5  # Filter silence hallucinations
         )
         
         # Convert iterator to list to get total count

@@ -18,6 +18,7 @@ ENV/
 models/
 transcripts/
 *.log
+temp_audio/
 
 # OS
 .DS_Store

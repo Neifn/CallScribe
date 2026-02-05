@@ -48,16 +48,14 @@ async def lifespan(app: FastAPI):
     logger.info("Application started")
     yield
     
-    # Cleanup
-    if audio_capture and audio_capture.is_recording:
-        audio_capture.stop()
-    
-    # Clean up temp files
-    for temp_file in config.TEMP_AUDIO_DIR.glob("*.wav"):
-        try:
-            temp_file.unlink()
-        except Exception as e:
-            logger.warning(f"Failed to delete temp file {temp_file}: {e}")
+    # Cleanup temp files if enabled
+    if config.DELETE_TEMP_AUDIO:
+        for temp_file in config.TEMP_AUDIO_DIR.glob("*.wav"):
+            try:
+                temp_file.unlink()
+                logger.info(f"Deleted temp file: {temp_file}")
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file {temp_file}: {e}")
     
     logger.info("Application shutdown")
 
@@ -263,14 +261,22 @@ async def stop_transcription(save: bool = True) -> Dict[str, Any]:
         session_start_time = None
         return result
         
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        await broadcast_message({"type": "error", "message": str(e)})
+        session_start_time = None
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    
     finally:
-        # Clean up temporary audio file
-        try:
-            if audio_file and audio_file.exists():
+        # Clean up temp audio file if configured
+        if config.DELETE_TEMP_AUDIO and audio_file and audio_file.exists():
+            try:
                 audio_file.unlink()
                 logger.info(f"Deleted temporary audio file: {audio_file}")
-        except Exception as e:
-            logger.warning(f"Failed to delete temp file {audio_file}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file {audio_file}: {e}")
+        elif audio_file:
+            logger.info(f"Temp audio kept: {audio_file}")
 
 
 @app.post("/api/cancel")
@@ -284,13 +290,15 @@ async def cancel_recording() -> Dict[str, Any]:
     # Stop recording
     audio_file = audio_capture.stop()
     
-    # Delete the temp file
-    if audio_file and audio_file.exists():
+    # Clean up temp file if configured
+    if config.DELETE_TEMP_AUDIO and audio_file and audio_file.exists():
         try:
             audio_file.unlink()
             logger.info(f"Deleted temporary audio file: {audio_file}")
         except Exception as e:
             logger.warning(f"Failed to delete temp file: {e}")
+    elif audio_file:
+        logger.info(f"Recording cancelled, audio kept: {audio_file}")
     
     session_start_time = None
     await broadcast_message({"type": "status", "status": "cancelled"})

@@ -20,7 +20,7 @@ CHANNELS = 2  # BlackHole 2ch needs 2 channels
 # Whisper settings
 # Language-specific model selection for optimal performance
 LANGUAGE_MODELS = {
-    "en": os.getenv("CALLSCRIBE_MODEL_EN", "medium"),     # Balance speed/accuracy for English
+    "en": os.getenv("CALLSCRIBE_MODEL_EN", "large-v3"),     # Maximum accuracy for English
     "uk": os.getenv("CALLSCRIBE_MODEL_UK", "large-v3")    # Maximum quality for Ukrainian
 }
 
@@ -34,13 +34,24 @@ def get_compute_type() -> str:
         import torch
         if torch.cuda.is_available():
             return "float16"
-        elif torch.backends.mps.is_available():
-            return "float16"  # Apple Silicon
+        # MPS (Apple Silicon) doesn't efficiently support float16 for Whisper
+        # Use int8 for better compatibility
     except ImportError:
         pass
-    return "int8"  # CPU fallback
+    return "int8"  # CPU/MPS fallback
 
 COMPUTE_TYPE = os.getenv("CALLSCRIBE_COMPUTE_TYPE", get_compute_type())
+
+# Temp audio file management
+DELETE_TEMP_AUDIO = os.getenv("CALLSCRIBE_DELETE_TEMP_AUDIO", "false").lower() == "true"
+
+# Accuracy optimizations - improved VAD parameters
+VAD_PARAMETERS = {
+    "threshold": 0.4,                    # Lower = more sensitive (default: 0.5)
+    "min_speech_duration_ms": 100,       # Minimum duration for valid speech
+    "min_silence_duration_ms": 1000,     # Longer silence before splitting (was 500)
+    "speech_pad_ms": 200                 # Padding around detected speech
+}
 
 # Supported languages
 LANGUAGES = {
