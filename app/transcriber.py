@@ -108,30 +108,40 @@ class Transcriber:
         
         logger.info(f"Starting transcription of {audio_file} (language: {lang})")
         
-        # Transcribe the file with accuracy optimizations
+        # Transcribe the file with strong anti-hallucination settings
+        # These settings are aggressive to prevent loops on long files
         segments_iterator, info = model.transcribe(
             str(audio_file),
             language=lang_code,
-            beam_size=8,
-            best_of=8,  # Test multiple candidates for accuracy
+            beam_size=5,  # Reduced from 8 for faster, more focused decoding
             temperature=0.0,  # Deterministic output
             vad_filter=True,
             vad_parameters=config.VAD_PARAMETERS,
             word_timestamps=False,
-            condition_on_previous_text=True,  # Use context
-            compression_ratio_threshold=2.2,  # Detect gibberish
-            no_speech_threshold=0.5  # Filter silence hallucinations
+            condition_on_previous_text=False,  # CHANGED: Disable to prevent context-based hallucinations
+            compression_ratio_threshold=2.4,  # Increased from 2.2 - more aggressive gibberish detection
+            log_prob_threshold=-1.0,  # NEW: Filter out low-confidence segments (default is -inf)
+            no_speech_threshold=0.6,  # Increased from 0.5 - more aggressive silence filtering
+            repetition_penalty=1.2  # NEW: Penalize repetitive patterns
         )
         
-        # Convert iterator to list to get total count
-        segments_list = list(segments_iterator)
-        total_segments = len(segments_list)
+        # Process segments as they come from the iterator for real-time progress
+        # We don't know the total count ahead of time, so we'll estimate based on audio duration
+        # Typical segment length is 2-10 seconds, we'll estimate ~5 seconds per segment
+        estimated_total = int(info.duration / 5) if hasattr(info, 'duration') else 100
         
         logger.info(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
-        logger.info(f"Processing {total_segments} segments...")
+        logger.info(f"Processing segments (estimated {estimated_total})...")
         
-        # Process segments
-        for idx, segment in enumerate(segments_list, 1):
+        
+        # Process segments incrementally for real-time progress
+        segment_count = 0
+        last_texts = []  # Track last N segments for hallucination detection
+        hallucination_threshold = 3  # REDUCED from 5: If same text appears 3 times in a row, stop
+        
+        for segment in segments_iterator:
+            segment_count += 1
+            
             ts = TranscriptSegment(
                 text=segment.text.strip(),
                 start=segment.start,
@@ -139,16 +149,34 @@ class Transcriber:
                 language=info.language
             )
             
-            if ts.text:  # Only add non-empty segments
+            # Hallucination detection: check if we're repeating the same phrase
+            if ts.text:
+                # Keep last N texts
+                last_texts.append(ts.text.lower())
+                if len(last_texts) > hallucination_threshold:
+                    last_texts.pop(0)
+                
+                # Check if all recent segments are identical
+                if len(last_texts) >= hallucination_threshold:
+                    if len(set(last_texts)) == 1:  # All segments are the same
+                        logger.warning(f"Hallucination detected: phrase '{ts.text}' repeated {hallucination_threshold} times. Stopping transcription.")
+                        break
+                
                 self._segments.append(ts)
                 
                 # Notify callback
                 if self._on_segment:
                     self._on_segment(ts)
             
-            # Notify progress
+            # Notify progress with updated estimate
             if self._on_progress:
-                self._on_progress(idx, total_segments)
+                # Update estimate as we go
+                current_time = segment.end if hasattr(segment, 'end') else 0
+                if hasattr(info, 'duration') and info.duration > 0:
+                    # Calculate progress based on time position
+                    progress_pct = min(int((current_time / info.duration) * 100), 99)
+                # Use percentage for total, current for actual count
+                self._on_progress(segment_count, max(estimated_total, segment_count))
         
         logger.info(f"Transcription complete: {len(self._segments)} segments")
         return self._segments

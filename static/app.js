@@ -18,6 +18,20 @@ class TranscriptionApp {
         this.clearBtn = document.getElementById('clear-btn');
         this.loadingOverlay = document.getElementById('loading-overlay');
 
+        // Manual transcription elements
+        this.fileUploadInput = document.getElementById('file-upload-input');
+        this.fileUploadBtn = document.getElementById('file-upload-btn');
+        this.uploadFilename = document.getElementById('upload-filename');
+        this.savedFileSelect = document.getElementById('saved-file-select');
+        this.refreshFilesBtn = document.getElementById('refresh-files-btn');
+        this.manualLanguageSelect = document.getElementById('manual-language-select');
+        this.transcribeFileBtn = document.getElementById('transcribe-file-btn');
+        this.cancelTranscriptionBtn = document.getElementById('cancel-transcription-btn');
+        this.transcriptionProgress = document.getElementById('transcription-progress');
+        this.progressText = document.getElementById('progress-text');
+        this.progressPercent = document.getElementById('progress-percent');
+        this.progressBarFill = document.getElementById('progress-bar-fill');
+
         // State
         this.isRecording = false;
         this.isProcessing = false;
@@ -25,6 +39,7 @@ class TranscriptionApp {
         this.segments = [];
         this.startTime = null;
         this.durationInterval = null;
+        this.selectedFile = null;
 
         // Initialize
         this.init();
@@ -37,6 +52,9 @@ class TranscriptionApp {
         // Check model status
         await this.checkStatus();
 
+        // Load saved files
+        await this.loadSavedFiles();
+
         // Bind events
         this.bindEvents();
     }
@@ -47,6 +65,14 @@ class TranscriptionApp {
         this.copyBtn.addEventListener('click', () => this.copyTranscript());
         this.downloadBtn.addEventListener('click', () => this.downloadTranscript());
         this.clearBtn.addEventListener('click', () => this.clearTranscript());
+
+        // Manual transcription events
+        this.fileUploadBtn.addEventListener('click', () => this.fileUploadInput.click());
+        this.fileUploadInput.addEventListener('change', (e) => this.handleFileSelect(e));
+        this.savedFileSelect.addEventListener('change', () => this.handleSavedFileSelect());
+        this.refreshFilesBtn.addEventListener('click', () => this.loadSavedFiles());
+        this.transcribeFileBtn.addEventListener('click', () => this.transcribeSelectedFile());
+        this.cancelTranscriptionBtn.addEventListener('click', () => this.cancelTranscription());
     }
 
     async loadDevices() {
@@ -227,6 +253,7 @@ class TranscriptionApp {
             // Handle progress updates
             if (data.type === 'progress') {
                 this.setStatus('processing', `Processing... ${data.percent}% (${data.current}/${data.total} segments)`);
+                this.updateProgress(data.percent, `Processing segment ${data.current} of ${data.total}`);
                 return;
             }
 
@@ -340,6 +367,161 @@ class TranscriptionApp {
     clearTranscript() {
         this.segments = [];
         this.transcriptEl.innerHTML = '<p class="placeholder">Transcription will appear here...</p>';
+    }
+
+    // Manual transcription methods
+    async loadSavedFiles() {
+        try {
+            const response = await fetch('/api/temp-files');
+            const data = await response.json();
+
+            // Clear and populate dropdown
+            this.savedFileSelect.innerHTML = '<option value="">Select a recording...</option>';
+
+            if (data.files && data.files.length > 0) {
+                data.files.forEach(file => {
+                    const option = document.createElement('option');
+                    option.value = file.path;
+                    const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
+                    const date = new Date(file.modified).toLocaleString();
+                    option.textContent = `${file.filename} (${sizeMB} MB) - ${date}`;
+                    this.savedFileSelect.appendChild(option);
+                });
+            }
+        } catch (error) {
+            console.error('Failed to load saved files:', error);
+        }
+    }
+
+    handleFileSelect(event) {
+        const file = event.target.files[0];
+        if (file) {
+            this.selectedFile = file;
+            this.uploadFilename.textContent = file.name;
+            this.savedFileSelect.value = '';  // Clear saved file selection
+            this.transcribeFileBtn.disabled = false;
+        }
+    }
+
+    handleSavedFileSelect() {
+        const selectedPath = this.savedFileSelect.value;
+        if (selectedPath) {
+            this.selectedFile = null;  // Clear uploaded file
+            this.fileUploadInput.value = '';
+            this.uploadFilename.textContent = '';
+            this.transcribeFileBtn.disabled = false;
+        } else {
+            this.transcribeFileBtn.disabled = !this.selectedFile;
+        }
+    }
+
+    async transcribeSelectedFile() {
+        if (this.isProcessing) {
+            return;
+        }
+
+        const language = this.manualLanguageSelect.value;
+
+        try {
+            this.isProcessing = true;
+            this.transcribeFileBtn.disabled = true;
+            this.transcribeFileBtn.style.display = 'none';
+            this.cancelTranscriptionBtn.style.display = 'inline-block';
+            this.transcriptionProgress.style.display = 'block';
+            this.updateProgress(0, 'Starting transcription...');
+            this.clearTranscript();
+            this.setStatus('processing', 'Processing file...');
+
+            // Connect WebSocket for real-time updates
+            this.connectWebSocket();
+
+            let response;
+
+            // Upload file or use saved file path
+            if (this.selectedFile) {
+                // Upload new file
+                const formData = new FormData();
+                formData.append('file', this.selectedFile);
+                formData.append('language', language);
+                formData.append('save', 'true');
+
+                response = await fetch('/api/transcribe-file', {
+                    method: 'POST',
+                    body: formData
+                });
+            } else {
+                // Use saved file - send as query parameters
+                const filePath = this.savedFileSelect.value;
+                console.log('Selected file path:', filePath);
+
+                if (!filePath) {
+                    throw new Error('No file selected');
+                }
+
+                const params = new URLSearchParams({
+                    file_path: filePath,
+                    language: language,
+                    save: 'true'
+                });
+
+                console.log('Request URL:', `/api/transcribe-file?${params}`);
+
+                response = await fetch(`/api/transcribe-file?${params}`, {
+                    method: 'POST'
+                });
+            }
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Transcription failed');
+            }
+
+            const result = await response.json();
+
+            // Status will be updated via WebSocket, but set final message
+            this.setStatus('ready', `Saved! ${result.segments_count} segments transcribed`);
+
+            // Reset selections
+            this.selectedFile = null;
+            this.fileUploadInput.value = '';
+            this.uploadFilename.textContent = '';
+            this.savedFileSelect.value = '';
+
+        } catch (error) {
+            console.error('File transcription error:', error);
+            this.setStatus('error', error.message || 'Transcription failed');
+        } finally {
+            this.isProcessing = false;
+            this.transcribeFileBtn.disabled = false;
+            this.transcribeFileBtn.style.display = 'inline-block';
+            this.cancelTranscriptionBtn.style.display = 'none';
+            this.transcriptionProgress.style.display = 'none';
+        }
+    }
+
+    updateProgress(percent, text) {
+        this.progressPercent.textContent = `${percent}%`;
+        this.progressText.textContent = text;
+        this.progressBarFill.style.width = `${percent}%`;
+    }
+
+    async cancelTranscription() {
+        if (!this.isProcessing) {
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/cancel', { method: 'POST' });
+            if (response.ok) {
+                this.setStatus('ready', 'Transcription cancelled');
+                this.isProcessing = false;
+                this.transcribeFileBtn.style.display = 'inline-block';
+                this.cancelTranscriptionBtn.style.display = 'none';
+                this.transcriptionProgress.style.display = 'none';
+            }
+        } catch (error) {
+            console.error('Cancel error:', error);
+        }
     }
 }
 

@@ -50,6 +50,68 @@
                 <span id="duration"></span>
             </section>
 
+            <!-- Manual Transcription Section -->
+            <section class="manual-transcription-panel">
+                <div class="panel-header">
+                    <h3>📁 Manual Transcription</h3>
+                    <p class="panel-subtitle">Upload a file or select a saved recording</p>
+                </div>
+
+                <div class="manual-controls">
+                    <div class="control-group">
+                        <label for="file-upload-input">Upload Audio File</label>
+                        <div class="file-upload-wrapper">
+                            <input type="file" id="file-upload-input" accept=".wav,.mp3,.m4a,.ogg,.webm"
+                                style="display: none;">
+                            <button id="file-upload-btn" class="btn btn-small">
+                                📤 Choose File
+                            </button>
+                            <span id="upload-filename" class="upload-filename"></span>
+                        </div>
+                    </div>
+
+                    <div class="divider-text">OR</div>
+
+                    <div class="control-group">
+                        <label for="saved-file-select">Saved Recordings</label>
+                        <select id="saved-file-select">
+                            <option value="">Select a recording...</option>
+                        </select>
+                        <button id="refresh-files-btn" class="btn btn-small" title="Refresh list">
+                            🔄 Refresh
+                        </button>
+                    </div>
+
+                    <div class="control-group">
+                        <label for="manual-language-select">Language</label>
+                        <select id="manual-language-select">
+                            <option value="en">English 🇺🇸</option>
+                            <option value="uk">Ukrainian 🇺🇦</option>
+                        </select>
+                    </div>
+
+                    <div class="control-group">
+                        <button id="transcribe-file-btn" class="btn btn-primary" disabled>
+                            ⚡ Transcribe File
+                        </button>
+                        <button id="cancel-transcription-btn" class="btn btn-danger" style="display: none;">
+                            ⏹ Cancel
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Progress Bar -->
+                <div id="transcription-progress" class="transcription-progress" style="display: none;">
+                    <div class="progress-info">
+                        <span id="progress-text">Processing...</span>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div class="progress-bar-container">
+                        <div id="progress-bar-fill" class="progress-bar-fill"></div>
+                    </div>
+                </div>
+            </section>
+
             <!-- Transcript Area -->
             <section class="transcript-section">
                 <div class="transcript-header">
@@ -86,7 +148,7 @@
         </footer>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2"></script>
 </body>
 
 </html>

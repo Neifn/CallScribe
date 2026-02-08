@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, File, UploadFile, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -359,3 +359,152 @@ async def list_saved_transcripts() -> Dict[str, Any]:
             "created": datetime.fromtimestamp(txt_file.stat().st_mtime).isoformat()
         })
     return {"transcripts": sorted(transcripts, key=lambda x: x["created"], reverse=True)}
+
+
+@app.get("/api/temp-files")
+async def list_temp_files() -> Dict[str, Any]:
+    """List all temporary audio files available for transcription."""
+    temp_files = []
+    for wav_file in config.TEMP_AUDIO_DIR.glob("*.wav"):
+        stats = wav_file.stat()
+        temp_files.append({
+            "filename": wav_file.name,
+            "path": str(wav_file),
+            "size": stats.st_size,
+            "created": datetime.fromtimestamp(stats.st_ctime).isoformat(),
+            "modified": datetime.fromtimestamp(stats.st_mtime).isoformat()
+        })
+    return {"files": sorted(temp_files, key=lambda x: x["modified"], reverse=True)}
+
+
+@app.post("/api/transcribe-file")
+async def transcribe_file(
+    file: Optional[UploadFile] = File(None),
+    file_path: Optional[str] = Query(None),
+    language: str = Query("en"),
+    save: bool = Query(True)
+) -> Dict[str, Any]:
+    """Transcribe an uploaded file or existing temp file manually."""
+    global transcriber
+    
+    # Debug logging
+    logger.info(f"Transcribe file request - file: {file}, file_path: {file_path}, language: {language}, save: {save}")
+    
+    if not transcriber:
+        raise HTTPException(status_code=500, detail="Transcriber not initialized")
+    
+    audio_file_path: Optional[Path] = None
+    temp_uploaded_file = False
+    
+    try:
+        # Handle uploaded file
+        if file:
+            # Save uploaded file to temp directory
+            temp_file_path = config.TEMP_AUDIO_DIR / f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+            
+            with open(temp_file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            
+            audio_file_path = temp_file_path
+            temp_uploaded_file = True
+            logger.info(f"Uploaded file saved to {audio_file_path}")
+        
+        # Handle file path to existing temp file
+        elif file_path:
+            audio_file_path = Path(file_path)
+            if not audio_file_path.exists():
+                raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+            if not audio_file_path.is_relative_to(config.TEMP_AUDIO_DIR):
+                raise HTTPException(status_code=403, detail="File must be in temp_audio directory")
+            logger.info(f"Transcribing existing file: {audio_file_path}")
+        
+        else:
+            raise HTTPException(status_code=400, detail="Either file or file_path must be provided")
+        
+        # Notify clients that processing is starting
+        await broadcast_message({"type": "status", "status": "processing"})
+        
+        # Set up callbacks for real-time updates
+        def on_segment(segment: TranscriptSegment):
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(broadcast_segment(segment), main_loop)
+        
+        def on_progress(current: int, total: int):
+            if main_loop and main_loop.is_running():
+                progress_pct = int((current / total) * 100) if total > 0 else 0
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_message({
+                        "type": "progress", 
+                        "current": current, 
+                        "total": total,
+                        "percent": progress_pct
+                    }), 
+                    main_loop
+                )
+        
+        transcriber.set_segment_callback(on_segment)
+        transcriber.set_progress_callback(on_progress)
+        
+        # Transcribe in executor to avoid blocking
+        segments = await asyncio.get_event_loop().run_in_executor(
+            None,
+            transcriber.transcribe_file,
+            audio_file_path,
+            language
+        )
+        
+        # Get results
+        full_text = transcriber.get_full_transcript()
+        srt_content = transcriber.export_srt()
+        
+        result = {
+            "status": "completed",
+            "segments_count": len(segments),
+            "transcript": full_text,
+            "source_file": str(audio_file_path)
+        }
+        
+        # Save to file if requested
+        if save and segments:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Save as text
+            txt_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.txt"
+            txt_path.write_text(full_text)
+            
+            # Save as SRT
+            srt_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.srt"
+            srt_path.write_text(srt_content)
+            
+            # Save as JSON
+            json_path = config.TRANSCRIPTS_DIR / f"transcript_{timestamp}.json"
+            json_path.write_text(json.dumps([s.to_dict() for s in segments], indent=2))
+            
+            result["saved_files"] = {
+                "txt": str(txt_path),
+                "srt": str(srt_path),
+                "json": str(json_path)
+            }
+            
+            logger.info(f"Saved transcript to {txt_path}")
+        
+        # Notify completion
+        await broadcast_message({"type": "status", "status": "completed"})
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"File transcription failed: {e}")
+        await broadcast_message({"type": "error", "message": str(e)})
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    
+    finally:
+        # Clean up uploaded file if configured (but keep existing temp files)
+        if temp_uploaded_file and config.DELETE_TEMP_AUDIO and audio_file_path and audio_file_path.exists():
+            try:
+                audio_file_path.unlink()
+                logger.info(f"Deleted uploaded file: {audio_file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete uploaded file {audio_file_path}: {e}")
+
